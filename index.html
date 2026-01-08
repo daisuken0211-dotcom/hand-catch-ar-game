@@ -1,429 +1,433 @@
 <!DOCTYPE html>
 <html lang="ja">
-  <head>
-    <meta charset="UTF-8" />
-    <title>Hand Catch AR Game (Circle Version)</title>
-    
-    <style>
-      html, body {
-        margin: 0;
-        padding: 0;
-        overflow: hidden;
-        background: #000;
-        color: #fff;
-        font-family: system-ui, sans-serif;
-        height: 100%;
+<head>
+<meta charset="UTF-8" />
+<title>Hand Catch AR Game</title>
+
+<style>
+html, body {
+  margin: 0;
+  padding: 0;
+  overflow: hidden;
+  background: #000;
+  color: #fff;
+  font-family: system-ui, sans-serif;
+  height: 100%;
+}
+#gameContainer {
+  position: relative;
+  width: 100vw;
+  height: 100vh;
+}
+#canvas {
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+#video { display: none; }
+
+#hud {
+  position: fixed;
+  top: 10px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  gap: 16px;
+  padding: 8px 16px;
+  background: rgba(0,0,0,0.5);
+  border-radius: 999px;
+  font-size: 16px;
+  z-index: 10;
+}
+
+#controls {
+  position: fixed;
+  bottom: 20px;
+  left: 50%;
+  transform: translateX(-50%);
+  text-align: center;
+  z-index: 10;
+}
+
+#modeSelect {
+  display: flex;
+  gap: 10px;
+  justify-content: center;
+  margin-bottom: 8px;
+}
+
+button {
+  padding: 10px 22px;
+  border-radius: 999px;
+  border: none;
+  font-size: 15px;
+  cursor: pointer;
+}
+#startButton {
+  background: #22c55e;
+  color: #fff;
+  font-weight: bold;
+}
+#startButton:disabled {
+  opacity: 0.5;
+}
+
+#message {
+  margin-bottom: 6px;
+  min-height: 24px;
+}
+
+#flashEffect {
+  position: fixed;
+  inset: 0;
+  background: white;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.15s;
+  z-index: 50;
+}
+</style>
+</head>
+
+<body>
+<div id="gameContainer">
+  <video id="video" playsinline></video>
+  <canvas id="canvas"></canvas>
+</div>
+
+<div id="flashEffect"></div>
+
+<div id="hud">
+  <div>SCORE <span id="score">0</span></div>
+  <div>LIVES <span id="lives">5</span></div>
+  <div>BEST <span id="bestScore">0</span></div>
+</div>
+
+<div id="controls">
+  <div id="message">モードを選択してください</div>
+
+  <div id="modeSelect">
+    <button id="modeNormal">通常モード</button>
+    <button id="modeEndless">継続モード</button>
+  </div>
+
+  <button id="startButton" disabled>ゲーム開始</button>
+</div>
+
+<audio id="catchSoundNormal" src="catch_normal.mp3" preload="auto"></audio>
+<audio id="catchSoundRare" src="catch_rare.mp3" preload="auto"></audio>
+
+<script type="module">
+import {
+  FilesetResolver,
+  HandLandmarker
+} from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.3";
+
+const video = document.getElementById("video");
+const canvas = document.getElementById("canvas");
+const ctx = canvas.getContext("2d");
+
+const scoreEl = document.getElementById("score");
+const livesEl = document.getElementById("lives");
+const bestScoreEl = document.getElementById("bestScore");
+const messageEl = document.getElementById("message");
+const flash = document.getElementById("flashEffect");
+
+const startButton = document.getElementById("startButton");
+const modeSelect = document.getElementById("modeSelect");
+const modeNormalBtn = document.getElementById("modeNormal");
+const modeEndlessBtn = document.getElementById("modeEndless");
+
+const soundNormal = document.getElementById("catchSoundNormal");
+const soundRare = document.getElementById("catchSoundRare");
+
+let gameMode = "normal"; // normal | endless
+let gameRunning = false;
+
+let score = 0;
+let lives = 5;
+let bestScore = Number(localStorage.getItem("catch_best") || 0);
+bestScoreEl.textContent = bestScore;
+
+let objects = [];
+let spawnTimer = 0;
+let spawnInterval = 1.2;
+let lastFrame = null;
+
+let hands = [];
+const handRadius = 50;
+
+let handLandmarker = null;
+let stream = null;
+let flashTimeout = null;
+
+/* -------- モード選択 -------- */
+modeNormalBtn.onclick = () => {
+  gameMode = "normal";
+  messageEl.textContent = "通常モード：落とすと終了";
+  startButton.disabled = false;
+};
+
+modeEndlessBtn.onclick = () => {
+  gameMode = "endless";
+  messageEl.textContent = "継続モード：落としても続く";
+  startButton.disabled = false;
+};
+
+/* -------- HandLandmarker 初期化 -------- */
+async function initHand() {
+  const vision = await FilesetResolver.forVisionTasks(
+    "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.3/wasm"
+  );
+  handLandmarker = await HandLandmarker.createFromOptions(vision, {
+    baseOptions: {
+      modelAssetPath:
+        "https://storage.googleapis.com/mediapipe-tasks/hand_landmarker/hand_landmarker.task"
+    },
+    numHands: 2,
+    runningMode: "VIDEO"
+  });
+}
+
+/* -------- 音声再生の安全なラッパー -------- */
+function playSound(el) {
+  try {
+    // 既存要素で再生できる場合は currentTime をリセットして再利用
+    el.currentTime = 0;
+    el.play().catch(() => {
+      // 再生失敗したらクローンして再生（重ねて鳴らす）
+      const s = el.cloneNode();
+      s.play().catch(()=>{});
+      // クローンはしばらくしたら remove
+      setTimeout(()=>{ s.pause(); s.remove(); }, 3000);
+    });
+  } catch {
+    const s = el.cloneNode();
+    s.play().catch(()=>{});
+    setTimeout(()=>{ s.pause(); s.remove(); }, 3000);
+  }
+}
+
+/* -------- スポーン等ゲームロジック -------- */
+function spawn() {
+  return {
+    x: 60 + Math.random() * (canvas.width - 120),
+    y: -40,
+    vy: 160 + Math.random() * 140,
+    r: 40,
+    glow: Math.random() < 0.15,
+    score: 100,
+    num: Math.floor(Math.random()*9)+1
+  };
+}
+
+function update(dt) {
+  spawnTimer += dt;
+  if (spawnTimer > spawnInterval) {
+    spawnTimer = 0;
+    objects.push(spawn());
+    spawnInterval = Math.max(0.45, spawnInterval - 0.01);
+  }
+
+  const next = [];
+  for (const o of objects) {
+    o.y += o.vy * dt;
+    let caught = false;
+
+    for (const h of hands) {
+      if (Math.hypot(o.x-h.x, o.y-h.y) < o.r + handRadius) {
+        playSound(o.glow ? soundRare : soundNormal);
+        score += o.glow ? o.score*2 : o.score;
+        scoreEl.textContent = score;
+        caught = true;
+        break;
       }
-      #gameContainer {
-        position: relative;
-        width: 100vw;
-        height: 100vh;
-        background: #000;
-        display: flex;
-        align-items: center;
-        justify-content: center;
-      }
-      #canvas {
-        max-width: 100%;
-        max-height: 100%;
-        background: #000;
-      }
-      #video { display: none; }
-      
-      #hud {
-        position: fixed;
-        top: 10px;
-        left: 50%;
-        transform: translateX(-50%);
-        display: flex;
-        gap: 16px;
-        padding: 8px 16px;
-        background: rgba(0,0,0,0.5);
-        border-radius: 999px;
-        font-size: 16px;
-        z-index: 10;
-        backdrop-filter: blur(6px);
-      }
-      #hud span.label { opacity: 0.8; margin-right: 4px; }
-      
-      #controls {
-        position: fixed;
-        bottom: 20px;
-        left: 50%;
-        transform: translateX(-50%);
-        display: flex;
-        flex-direction: column;
-        align-items: center;
-        gap: 8px;
-        z-index: 10;
-      }
-      
-      #message {
-        font-size: 18px;
-        min-height: 24px;
-        margin-bottom: 8px;
-        text-align: center;
-        text-shadow: 0 0 6px rgba(0,0,0,0.8);
-      }
-      
-      button {
-        padding: 10px 24px;
-        border-radius: 999px;
-        border: none;
-        font-size: 16px;
-        cursor: pointer;
-      }
-      #startButton {
-        background: #22c55e;
-        color: #fff;
-        font-weight: 600;
-      }
-      #startButton:disabled {
-        opacity: 0.5;
-        cursor: default;
-      }
-      
-      #note {
-        position: fixed;
-        left: 10px;
-        bottom: 10px;
-        font-size: 12px;
-        opacity: 0.7;
-        max-width: 260px;
-        z-index: 10;
-      }
-      
-      #flashEffect {
-        position: fixed;
-        left: 0; top: 0;
-        width: 100vw;
-        height: 100vh;
-        background: white;
-        opacity: 0;
-        pointer-events: none;
-        transition: opacity 0.15s ease-out;
-        z-index: 50;
-      }
-    </style>
-  </head>
-  
-  <body>
-    <div id="gameContainer">
-      <video id="video" playsinline></video>
-      <canvas id="canvas"></canvas>
-    </div>
-    
-    <div id="flashEffect"></div>
-    
-    <div id="hud">
-      <div><span class="label">SCORE</span><span id="score">0</span></div>
-      <div><span class="label">LIVES</span><span id="lives">5</span></div>
-      <div><span class="label">BEST</span><span id="bestScore">0</span></div>
-    </div>
-    
-    <div id="controls">
-      <div id="message"></div>
-      <button id="startButton">ゲーム開始</button>
-    </div>
-    
-    <div id="note">
-      カメラアクセスを許可してください。<br>
-      数字の○を手のひらでキャッチしよう！<br>
-      光る○はポイント2倍！（レア音が鳴る）
-    </div>
-    
-    <!-- 通常キャッチ音 -->
-    <audio id="catchSoundNormal" src="catch_normal.mp3"></audio>
-    
-    <!-- レアキャッチ音（光る○） -->
-    <audio id="catchSoundRare" src="catch_rare.mp3"></audio>
-    
-    <script type="module">
-      import {
-        FilesetResolver,
-        HandLandmarker,
-      } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.3";
-      
-      const videoElement = document.getElementById("video");
-      const canvasElement = document.getElementById("canvas");
-      const ctx = canvasElement.getContext("2d");
-      
-      const scoreEl = document.getElementById("score");
-      const livesEl = document.getElementById("lives");
-      const bestScoreEl = document.getElementById("bestScore");
-      const messageEl = document.getElementById("message");
-      const startButton = document.getElementById("startButton");
-      const flash = document.getElementById("flashEffect");
-      
-      // ★サウンド変数（追加）
-      const catchSoundNormal = document.getElementById("catchSoundNormal");
-      const catchSoundRare = document.getElementById("catchSoundRare");
-      
-      /* ゲーム状態 */
-      let objects = [];
-      let score = 0;
-      let lives = 5;
-      let bestScore = 0;
-      let gameRunning = false;
-      
-      let lastFrame = null;
-      let spawnTimer = 0;
-      let spawnInterval = 1.2;
-      
-      const handRadius = 50;
-      let handsList = [];
-      
-      /* 手検出 */
-      let handLandmarker = null;
-      let detectionLoopId = null;
-      
-      async function createHandLandmarker() {
-        const vision = await FilesetResolver.forVisionTasks(
-          "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.3/wasm"
-        );
-        handLandmarker = await HandLandmarker.createFromOptions(vision, {
-            baseOptions: {
-              modelAssetPath:
-              "https://storage.googleapis.com/mediapipe-tasks/hand_landmarker/hand_landmarker.task",
-            },
-            numHands: 2,
-            runningMode: "VIDEO",
-        });
-      }
-      
-      /* ランキング */
-      function saveRanking(score) {
-        let ranking = JSON.parse(localStorage.getItem("catch_ranking") || "[]");
-        ranking.push(score);
-        ranking.sort((a, b) => b - a);
-        ranking = ranking.slice(0, 5);
-        localStorage.setItem("catch_ranking", JSON.stringify(ranking));
-        return ranking;
-      }
-      
-      function loadBestScore() {
-        bestScore = Number(localStorage.getItem("catch_best") || "0");
-        bestScoreEl.textContent = bestScore;
-      }
-      
-      function saveBestScore() {
-        localStorage.setItem("catch_best", bestScore);
-      }
-      
-      loadBestScore();
-      
-      /* 落下物（数字○）生成 */
-      function spawnObject() {
-        const w = canvasElement.width;
-        return {
-          x: 60 + Math.random() * (w - 120),
-          y: -40,
-          vy: 160 + Math.random() * 140,
-          radius: 40,
-          baseScore: 100,
-          glow: Math.random() < 0.15,
-          text: Math.floor(Math.random() * 9) + 1,
-        };
-      }
-      
-      /* ゲーム更新（完全修正版） */
-      function update(dt) {
-        if (!gameRunning) return;
-        spawnTimer += dt;
-        
-        if (spawnTimer >= spawnInterval) {
-          spawnTimer = 0;
-          objects.push(spawnObject());
-          spawnInterval = Math.max(0.45, spawnInterval - 0.01);
-        }
-        
-        const h = canvasElement.height;
-        const remain = [];
-        
-        for (const obj of objects) {
-          obj.y += obj.vy * dt;
-          
-          let caught = false;
-          
-          for (const hand of handsList) {
-            const dx = obj.x - hand.x;
-            const dy = obj.y - hand.y;
-            const dist = Math.hypot(dx, dy);
-            
-            // ★キャッチ判定
-            if (dist < obj.radius + handRadius) {
-              
-              // ★光る○だけレア音
-              if (obj.glow) {
-                catchSoundRare.currentTime = 0;
-                catchSoundRare.play().catch(() => {});
-              } else {
-                catchSoundNormal.currentTime = 0;
-                catchSoundNormal.play().catch(() => {});
-              }
-              
-              score += obj.glow ? obj.baseScore * 2 : obj.baseScore;
-              scoreEl.textContent = score;
-              
-              caught = true;
-              break;
-            }
-          }
-          
-          if (!caught) {
-            if (obj.y - obj.radius > h) {
-              flash.style.opacity = 0.8;
-              setTimeout(() => (flash.style.opacity = 0), 80);
-              lives--;
-              livesEl.textContent = lives;
-              
-              if (lives <= 0) return endGame();
-            } else {
-              remain.push(obj);
-            }
-          }
-        }
-        objects = remain;
-      }
-      
-      /* 描画 */
-      function draw() {
-        const w = canvasElement.width;
-        const h = canvasElement.height;
-        ctx.clearRect(0, 0, w, h);
-        
-        // ミラー映像
-        ctx.save();
-        ctx.scale(-1, 1);
-        ctx.drawImage(videoElement, -w, 0, w, h);
-        ctx.restore();
-        
-        // 手の円
-        for (const hand of handsList) {
-          ctx.beginPath();
-          ctx.arc(hand.x, hand.y, handRadius, 0, Math.PI * 2);
-          ctx.strokeStyle = "rgba(0,255,0,0.9)";
-          ctx.lineWidth = 4;
-          ctx.stroke();
-        }
-        
-        // 落下物
-        for (const o of objects) {
-          if (o.glow) {
-            ctx.beginPath();
-            ctx.arc(o.x, o.y, o.radius + 10, 0, Math.PI * 2);
-            ctx.strokeStyle = "rgba(255,255,100,0.7)";
-            ctx.lineWidth = 6;
-            ctx.stroke();
-          }
-          
-          ctx.beginPath();
-          ctx.arc(o.x, o.y, o.radius, 0, Math.PI * 2);
-          ctx.fillStyle = "#3498db";
-          ctx.fill();
-          
-          ctx.fillStyle = "#fff";
-          ctx.font = "30px sans-serif";
-          ctx.textAlign = "center";
-          ctx.textBaseline = "middle";
-          ctx.fillText(o.text, o.x, o.y);
-        }
-      }
-      
-      /* ゲームループ */
-      function loop(t) {
-        if (!gameRunning) return;
-        if (lastFrame == null) lastFrame = t;
-        const dt = (t - lastFrame) / 1000;
-        lastFrame = t;
-        
-        update(dt);
-        draw();
-        requestAnimationFrame(loop);
-      }
-      
-      /* 手の更新 */
-      function updateHands(results) {
-        handsList = [];
-        if (!results || !results.landmarks) return;
-        
-        const w = canvasElement.width;
-        const h = canvasElement.height;
-        
-        for (const hand of results.landmarks) {
-          const idx = [0, 5, 9, 13, 17];
-          let sx = 0, sy = 0;
-          for (let i of idx) {
-            sx += hand[i].x;
-            sy += hand[i].y;
-          }
-          const cx = (1 - sx / idx.length) * w;
-          const cy = (sy / idx.length) * h;
-          
-          handsList.push({ x: cx, y: cy });
-        }
-      }
-      
-      /* 検出ループ（10fps）*/
-      function startDetection() {
-        detectionLoopId = setInterval(() => {
-            if (!handLandmarker) return;
-            const now = performance.now();
-            const res = handLandmarker.detectForVideo(videoElement, now);
-            updateHands(res);
-        }, 100);
-      }
-      
-      /* ゲーム開始 */
-      startButton.addEventListener("click", async () => {
-          startButton.disabled = true;
-          messageEl.textContent = "カメラ起動中...";
-          
-          const stream = await navigator.mediaDevices.getUserMedia({
-              video: { width: 1280, height: 720, facingMode: "user" },
-          });
-          videoElement.srcObject = stream;
-          await videoElement.play();
-          
-          canvasElement.width = 1280;
-          canvasElement.height = 720;
-          
-          await createHandLandmarker();
-          startDetection();
-          
-          score = 0;
-          lives = 5;
-          objects = [];
-          spawnInterval = 1.2;
-          lastFrame = null;
-          
-          scoreEl.textContent = score;
+    }
+
+    if (!caught) {
+      if (o.y - o.r > canvas.height) {
+        // Missed
+        flash.style.opacity = 0.8;
+        if (flashTimeout) clearTimeout(flashTimeout);
+        flashTimeout = setTimeout(()=>flash.style.opacity=0,80);
+
+        if (gameMode === "normal") {
+          lives--;
           livesEl.textContent = lives;
-          
-          gameRunning = true;
-          messageEl.textContent = "スタート！";
-          
-          requestAnimationFrame(loop);
-      });
-      
-      /* ゲームオーバー */
-      function endGame() {
-        gameRunning = false;
-        startButton.disabled = false;
-        
-        const ranking = saveRanking(score);
-        let rText = ranking.map((v, i) => `${i + 1}位: ${v}点`).join("\n");
-        
-        messageEl.innerHTML =
-        `<div style="font-size:26px;font-weight:bold;">GAME OVER</div>
-        <pre>${rText}</pre>`;
-        
-        if (score > bestScore) {
-          bestScore = score;
-          bestScoreEl.textContent = bestScore;
-          saveBestScore();
+          if (lives <= 0) {
+            endGame();
+            return;
+          }
         }
+      } else {
+        next.push(o);
       }
-    </script>
-  </body>
+    }
+  }
+  objects = next;
+}
+
+function draw() {
+  ctx.clearRect(0,0,canvas.width,canvas.height);
+
+  // ミラー描画（ユーザー側から見て自然な向きに）
+  ctx.save();
+  ctx.scale(-1,1);
+  ctx.drawImage(video, -canvas.width, 0, canvas.width, canvas.height);
+  ctx.restore();
+
+  // 手の表示
+  hands.forEach(h=>{
+    ctx.strokeStyle="rgba(0,255,0,0.9)";
+    ctx.lineWidth=4;
+    ctx.beginPath();
+    ctx.arc(h.x,h.y,handRadius,0,Math.PI*2);
+    ctx.stroke();
+  });
+
+  // オブジェクト描画
+  objects.forEach(o=>{
+    if (o.glow) {
+      ctx.strokeStyle="rgba(255,255,120,0.7)";
+      ctx.lineWidth=6;
+      ctx.beginPath();
+      ctx.arc(o.x,o.y,o.r+10,0,Math.PI*2);
+      ctx.stroke();
+    }
+    ctx.fillStyle="#3498db";
+    ctx.beginPath();
+    ctx.arc(o.x,o.y,o.r,0,Math.PI*2);
+    ctx.fill();
+
+    ctx.fillStyle="#fff";
+    ctx.font="30px sans-serif";
+    ctx.textAlign="center";
+    ctx.textBaseline="middle";
+    ctx.fillText(o.num,o.x,o.y);
+  });
+}
+
+/* -------- 検出（毎フレーム）とメインループ統合 -------- */
+function processHandLandmarks(result) {
+  hands = [];
+  if (!result || !result.landmarks) return;
+  // result.landmarks は [hand1Landmarks, hand2Landmarks, ...] の形を想定
+  for (const lmSet of result.landmarks) {
+    if (!Array.isArray(lmSet) || lmSet.length === 0) continue;
+    // 指先や根元などの複数点の平均を取る（例として 0,5,9,13,17 を使用）
+    const idx = [0,5,9,13,17];
+    let ax = 0, ay = 0, count = 0;
+    idx.forEach(i => {
+      const p = lmSet[i];
+      if (p && typeof p.x === 'number' && typeof p.y === 'number') {
+        ax += p.x;
+        ay += p.y;
+        count++;
+      }
+    });
+    if (count === 0) continue;
+    const avgX = ax / count;
+    const avgY = ay / count;
+    // video と canvas は同じアスペクト・解像度にしている前提でマッピング
+    const x = (1 - avgX) * canvas.width; // ミラーしているので 1 - x
+    const y = avgY * canvas.height;
+    hands.push({ x, y });
+  }
+}
+
+function loop(t) {
+  if (!gameRunning) return;
+  if (!lastFrame) lastFrame = t;
+  const dt = (t - lastFrame) / 1000;
+  lastFrame = t;
+
+  // HandLandmarker が準備できていれば毎フレーム検出（VIDEO モード）
+  if (handLandmarker) {
+    try {
+      const res = handLandmarker.detectForVideo(video, performance.now());
+      processHandLandmarks(res);
+    } catch (e) {
+      // 検出で稀に例外が出る可能性があるため保険
+      // console.warn("hand detect error", e);
+    }
+  }
+
+  update(dt);
+  draw();
+  requestAnimationFrame(loop);
+}
+
+/* -------- 開始 / 終了 -------- */
+startButton.onclick = async () => {
+  startButton.disabled = true;
+  modeSelect.style.display = "none";
+  messageEl.textContent = "カメラ起動中…";
+
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "user" }, audio: false });
+  } catch (e) {
+    messageEl.textContent = "カメラの取得に失敗しました";
+    console.error(e);
+    startButton.disabled = false;
+    modeSelect.style.display = "flex";
+    return;
+  }
+
+  video.srcObject = stream;
+  try {
+    await video.play();
+  } catch (e) {
+    messageEl.textContent = "ビデオ再生に失敗しました";
+    console.error(e);
+    startButton.disabled = false;
+    modeSelect.style.display = "flex";
+    return;
+  }
+
+  // canvas の内部解像度をビデオに合わせる（表示は CSS で全画面に）
+  canvas.width = video.videoWidth || 1280;
+  canvas.height = video.videoHeight || 720;
+
+  messageEl.textContent = "モデル読み込み中…";
+  await initHand();
+
+  score = 0;
+  lives = 5;
+  objects = [];
+  spawnInterval = 1.2;
+  scoreEl.textContent = score;
+  livesEl.textContent = lives;
+
+  gameRunning = true;
+  lastFrame = null;
+  messageEl.textContent = "スタート！";
+  requestAnimationFrame(loop);
+};
+
+function stopStream() {
+  if (!stream) return;
+  const tracks = stream.getTracks();
+  tracks.forEach(t => {
+    try { t.stop(); } catch {}
+  });
+  stream = null;
+  video.srcObject = null;
+}
+
+function endGame() {
+  gameRunning = false;
+  modeSelect.style.display = "flex";
+  startButton.disabled = false;
+  messageEl.innerHTML = "<b>GAME OVER</b>";
+
+  stopStream();
+
+  if (score > bestScore) {
+    bestScore = score;
+    bestScoreEl.textContent = bestScore;
+    localStorage.setItem("catch_best", String(bestScore));
+  }
+}
+</script>
+</body>
 </html>
